@@ -1,4 +1,4 @@
-/* Hybrid FEC+ARQ receiver (C++ V1).
+/* Hybrid FEC+ARQ receiver (C++ V2).
  *
  * Ports (127.0.0.1):
  *   bind 47002  <- media via relay
@@ -20,7 +20,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 using namespace proto;
@@ -38,7 +37,8 @@ struct Parity {
 
 struct Gap {
     double first_seen = 0.0;
-    bool nakked = false;
+    double last_nak = 0.0;
+    int nak_count = 0;
 };
 
 static int make_udp() {
@@ -84,7 +84,6 @@ struct Ctx {
     std::unordered_map<uint32_t, Frame> frames;
     std::unordered_map<uint32_t, Parity> parities;
     std::unordered_map<uint32_t, Gap> gaps;
-    std::unordered_set<uint32_t> nakked;
 
     uint32_t highest_seen = 0;
     bool have_any = false;
@@ -135,47 +134,44 @@ static void try_fec(Ctx& c, uint32_t base) {
     deliver(c, base + uint32_t(missing), recovered);
 }
 
-static void send_nak(Ctx& c, uint32_t seq) {
-    if (c.nakked.count(seq)) return;
+static void send_nak(Ctx& c, uint32_t seq, Gap& g, double now) {
+    if (g.nak_count >= MAX_NAK) return;
     if (!useful_before_deadline(c.t0, c.delay_ms, seq)) return;
     uint8_t pkt[NAK_PKT];
     pkt[0] = TYPE_NAK;
     write_be32(pkt + 1, seq);
     sendto(c.out_fd, pkt, NAK_PKT, 0,
            reinterpret_cast<const sockaddr*>(&c.relay_fb), sizeof c.relay_fb);
-    c.nakked.insert(seq);
+    g.last_nak = now;
+    ++g.nak_count;
 }
 
 static void note_gaps_and_nak(Ctx& c) {
     if (!c.have_any) return;
     const double now = now_s();
 
-    // Mark gaps below highest_seen
-    for (uint32_t s = 0; s < c.highest_seen; ++s) {
+    // Only scan a sliding window near the frontier.
+    uint32_t start = 0;
+    if (c.highest_seen > uint32_t(SEQ_WINDOW))
+        start = c.highest_seen - uint32_t(SEQ_WINDOW);
+
+    for (uint32_t s = start; s < c.highest_seen; ++s) {
         auto it = c.frames.find(s);
         if (it != c.frames.end() && it->second.have) continue;
         Gap& g = c.gaps[s];
         if (g.first_seen == 0.0) g.first_seen = now;
-    }
 
-    // NAK after grace
-    std::vector<uint32_t> to_nak;
-    for (auto& kv : c.gaps) {
-        uint32_t s = kv.first;
-        Gap& g = kv.second;
-        auto it = c.frames.find(s);
-        if (it != c.frames.end() && it->second.have) continue;
-        if (g.nakked) continue;
-        if ((now - g.first_seen) * 1000.0 < NAK_GRACE_MS) continue;
-        to_nak.push_back(s);
-        g.nakked = true;
+        if (g.nak_count == 0) {
+            if ((now - g.first_seen) * 1000.0 >= NAK_GRACE_MS)
+                send_nak(c, s, g, now);
+        } else if (g.nak_count < MAX_NAK) {
+            if ((now - g.last_nak) * 1000.0 >= NAK_RETRY_MS)
+                send_nak(c, s, g, now);
+        }
     }
-    for (uint32_t s : to_nak)
-        send_nak(c, s);
 }
 
 static void prune(Ctx& c) {
-    // Drop frames far behind highest_seen to bound memory.
     if (!c.have_any) return;
     const uint32_t keep = uint32_t(SEQ_WINDOW);
     if (c.highest_seen < keep) return;

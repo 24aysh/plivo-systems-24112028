@@ -1,4 +1,4 @@
-/* Hybrid FEC+ARQ sender (C++ V1).
+/* Hybrid FEC+ARQ sender (C++ V2).
  *
  * Ports (127.0.0.1):
  *   bind 47010  <- harness source (4B BE seq + 160B payload)
@@ -19,7 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <unordered_set>
+#include <unordered_map>
 
 using namespace proto;
 
@@ -85,7 +85,7 @@ int main() {
     sockaddr_in relay = addr_port(47001);
 
     Slot ring[SEQ_WINDOW];
-    std::unordered_set<uint32_t> retransmitted;
+    std::unordered_map<uint32_t, int> rexmit_count;
 
     uint8_t xor_acc[PAYLOAD_BYTES]{};
     int xor_count = 0;
@@ -146,14 +146,15 @@ int main() {
                 if (buf[0] != TYPE_NAK) continue;
 
                 uint32_t seq = read_be32(buf + 1);
-                if (retransmitted.count(seq)) continue;
-                if (!useful_before_deadline(t0, delay_ms, seq)) continue;
+                int& nrex = rexmit_count[seq];
+                if (nrex >= MAX_REXMIT) continue;
+                if (!useful_retransmit(t0, delay_ms, seq)) continue;
 
                 Slot& slot = ring[seq % SEQ_WINDOW];
                 if (!slot.valid || slot.seq != seq) continue;
 
                 send_media(out_fd, relay, TYPE_DATA, seq, slot.payload);
-                retransmitted.insert(seq);
+                ++nrex;
             }
         }
     }
